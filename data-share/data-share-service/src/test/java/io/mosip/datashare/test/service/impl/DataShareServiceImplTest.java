@@ -1,31 +1,52 @@
 package io.mosip.datashare.test.service.impl;
 
 import static io.mosip.commons.khazana.constant.KhazanaErrorCodes.OBJECT_STORE_NOT_ACCESSIBLE;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.X509Certificate;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import io.mosip.commons.khazana.exception.ObjectStoreAdapterException;
 import io.mosip.datashare.exception.PolicyException;
+import io.mosip.kernel.core.util.StringUtils;
 import org.apache.commons.io.IOUtils;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactory;
+import org.apache.http.conn.ssl.TrustStrategy;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.runner.RunWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Mockito;
+import org.mockserver.client.MockServerClient;
+import org.mockserver.integration.ClientAndServer;
+import org.mockserver.model.HttpRequest;
+import org.mockserver.model.HttpResponse;
 import org.powermock.core.classloader.annotations.PowerMockIgnore;
 import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
 import org.powermock.modules.junit4.PowerMockRunnerDelegate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.env.Environment;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.junit4.SpringRunner;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -44,10 +65,17 @@ import io.mosip.datashare.util.DigitalSignatureUtil;
 import io.mosip.datashare.util.EncryptionUtil;
 import io.mosip.datashare.util.PolicyUtil;
 import io.mosip.kernel.core.util.CryptoUtil;
+import org.springframework.util.StopWatch;
+import org.springframework.web.client.ResourceAccessException;
+import org.springframework.web.client.RestTemplate;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
 
 @RunWith(PowerMockRunner.class)
 @PowerMockIgnore({ "com.sun.org.apache.xerces.*", "javax.xml.*", "org.xml.*", "javax.management.*", "org.w3c.dom.*",
-		"com.sun.org.apache.xalan.*" })
+		"com.sun.org.apache.xalan.*", "javax.net.ssl.*"})
 @PowerMockRunnerDelegate(SpringRunner.class)
 @PrepareForTest(value = { URL.class, CryptoUtil.class })
 public class DataShareServiceImplTest {
@@ -90,6 +118,9 @@ public class DataShareServiceImplTest {
 	MockMultipartFile multiPartFile;
 
 	InputStream inputStream;
+
+	private ClientAndServer mockServer;
+	private MockServerClient mockServerClient;
 
 	private PolicyAttributesDto policyAttributesDto;
 	@Before
@@ -146,6 +177,8 @@ public class DataShareServiceImplTest {
 		Mockito.when(cacheUtil.getShortUrlData(Mockito.any(), Mockito.any(), Mockito.any(),
 				Mockito.any()))
 				.thenReturn(POLICY_ID + "," + SUBSCRIBER_ID + "," + "dfg3456f");
+		mockServer = ClientAndServer.startClientAndServer(1100);
+		mockServerClient = new MockServerClient("localhost", 1100);
 	}
 
 	@Test
@@ -297,5 +330,55 @@ public class DataShareServiceImplTest {
 		Mockito.verify(objectStoreAdapter, Mockito.never()).decMetadata(Mockito.anyString(),
 				Mockito.anyString(), Mockito.anyString(), Mockito.anyString(),
 				Mockito.anyString(), Mockito.anyString());
+	}
+
+	@Test
+	public void testRestTemplateTimeout() {
+		mockServerClient.when(HttpRequest.request()
+						.withMethod("GET")
+						.withPath("/api/data"))
+				.respond(HttpResponse.response()
+						.withStatusCode(200)
+						.withBody("Hello")
+						.withDelay(TimeUnit.SECONDS, 10));
+
+		StopWatch stopWatch = new StopWatch();
+		stopWatch.start();
+		assertThrows(ResourceAccessException.class, () -> {
+			getRestTemplate().getForObject("http://localhost:1100/api/data", String.class);
+		});
+		stopWatch.stop();
+		var elapsed = stopWatch.getTotalTimeMillis();
+		System.out.println("Total time : " + elapsed);
+	}
+
+	private RestTemplate getRestTemplate()
+			throws NoSuchAlgorithmException, KeyStoreException, KeyManagementException {
+		var connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
+		TrustStrategy acceptingTrustStrategy = (X509Certificate[] chain, String authType) -> true;
+		SSLContext sslContext = org.apache.http.ssl.SSLContexts.custom()
+				.loadTrustMaterial(acceptingTrustStrategy).build();
+		SSLConnectionSocketFactory csf = new SSLConnectionSocketFactory(sslContext, new HostnameVerifier() {
+			public boolean verify(String arg0, SSLSession arg1) {
+				return true;
+			}
+		});
+		connectionManagerBuilder.setSSLSocketFactory(csf);
+		var connectionManager = connectionManagerBuilder.build();
+
+		HttpClientBuilder httpClientBuilder = HttpClients.custom()
+				.setConnectionManager(connectionManager)
+				.setDefaultRequestConfig(RequestConfig.custom().setResponseTimeout(Long.parseLong("5000"), TimeUnit.MILLISECONDS).build())
+				.disableCookieManagement();
+
+		HttpComponentsClientHttpRequestFactory requestFactory = new HttpComponentsClientHttpRequestFactory();
+		requestFactory.setHttpClient(httpClientBuilder.build());
+        return new RestTemplate(requestFactory);
+	}
+
+	@AfterEach
+	public void tearDown() {
+		// Stop the MockServer after the test
+		mockServer.stop();
 	}
 }
